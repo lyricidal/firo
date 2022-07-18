@@ -661,7 +661,7 @@ bool CheckTransaction(const CTransaction &tx, CValidationState &state, bool fChe
                 return false;
         }
 
-        auto params = ::Params().GetConsensus();
+        const auto &params = ::Params().GetConsensus();
         if (tx.IsZerocoinSpend() || tx.IsZerocoinMint()) {
             if (!isVerifyDB && nHeight >= params.nDisableZerocoinStartBlock)
                 return state.DoS(1, error("Zerocoin is disabled at this point"));
@@ -830,6 +830,9 @@ bool AcceptToMemoryPoolWorker(CTxMemPool& pool, CValidationState& state, const C
             }
             catch (CBadTxIn&) {
                 return state.Invalid(false, REJECT_CONFLICT, "txn-invalid-lelantus-joinsplit");
+            }
+            catch (...) {
+                return state.Invalid(false, REJECT_CONFLICT, "failed to deserialize joinsplit");
             }
 
             const std::vector<uint32_t> &ids = joinsplit->getCoinGroupIds();
@@ -1079,6 +1082,9 @@ bool AcceptToMemoryPoolWorker(CTxMemPool& pool, CValidationState& state, const C
                 }
                 catch (CBadTxIn&) {
                     return state.DoS(0, false, REJECT_INVALID, "unable to parse joinsplit");
+                }
+                catch (...) {
+                    return state.DoS(0, false, REJECT_INVALID, "failed to deserialize joinsplit");
                 }
             }
             // nModifiedFees includes any fee deltas from PrioritiseTransaction
@@ -1706,7 +1712,7 @@ bool ReadBlockHeaderFromDisk(CBlock &block, const CDiskBlockPos &pos) {
     return true;
 }
 
-CAmount GetBlockSubsidyWithMTPFlag(int nHeight, const Consensus::Params &consensusParams, bool fMTP) {
+CAmount GetBlockSubsidyWithMTPFlag(int nHeight, const Consensus::Params &consensusParams, bool fMTP, bool fShorterBlockDistance) {
     // Genesis block is 0 coin
     if (nHeight == 0)
         return 0;
@@ -1726,17 +1732,24 @@ CAmount GetBlockSubsidyWithMTPFlag(int nHeight, const Consensus::Params &consens
     if (nHeight > 0 && fMTP)
         nSubsidy /= consensusParams.nMTPRewardReduction;
 
+    if (nHeight > 0 && fShorterBlockDistance)
+        nSubsidy /= 2;
+
     return nSubsidy;
 }
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params &consensusParams, int nTime) {
-    return GetBlockSubsidyWithMTPFlag(nHeight, consensusParams, nTime >= (int)consensusParams.nMTPSwitchTime);
+    return GetBlockSubsidyWithMTPFlag(nHeight, consensusParams,
+            nTime >= (int)consensusParams.nMTPSwitchTime,
+            nTime >= (int)consensusParams.stage3StartTime);
 }
 
-CAmount GetMasternodePayment(int nHeight, CAmount blockValue)
+CAmount GetMasternodePayment(int nHeight, int nTime, CAmount blockValue)
 {
     const Consensus::Params &params = Params().GetConsensus();
-    if (nHeight >= params.nSubsidyHalvingFirst)
+    if (nTime >= params.stage3StartTime)
+        return blockValue*params.stage3MasternodeShare/100;
+    else if (nHeight >= params.nSubsidyHalvingFirst)
         return blockValue*params.stage2ZnodeShare/100;
     else
         return blockValue*3/10; // 30%
@@ -1964,6 +1977,9 @@ bool CheckTxInputs(const CTransaction& tx, CValidationState& state, const CCoins
             }
             catch (CBadTxIn&) {
                 return state.DoS(0, false, REJECT_INVALID, "unable to parse joinsplit");
+            }
+            catch (...) {
+                return state.DoS(0, false, REJECT_INVALID, "failed to deserialize joinsplit");
             }
         }
         if (nTxFee < 0)
@@ -2389,7 +2405,12 @@ static DisconnectResult DisconnectBlock(const CBlock& block, CValidationState& s
         if(tx.IsSigmaSpend())
             nFees += sigma::GetSigmaSpendInput(tx) - tx.GetValueOut();
         else if (tx.IsLelantusJoinSplit()) {
-            nFees += lelantus::ParseLelantusJoinSplit(tx)->getFee();
+            try {
+                nFees += lelantus::ParseLelantusJoinSplit(tx)->getFee();
+            }
+            catch (...) {
+                // do nothing
+            }
         }
 
         dbIndexHelper.DisconnectTransactionInputs(tx, pindex->nHeight, i, view);
@@ -2777,6 +2798,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                 catch (CBadTxIn&) {
                     return state.DoS(0, false, REJECT_INVALID, "unable to parse joinsplit");
                 }
+                catch (...) {
+                    return state.DoS(0, false, REJECT_INVALID, "failed to deserialize joinsplit");
+                }
             }
 
             // Check transaction against signa/lelantus state
@@ -2850,7 +2874,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         return state.DoS(0, error("ConnectBlock(EVOZNODES): %s", strError), REJECT_INVALID, "bad-cb-amount");
     }
 
-    if (!IsBlockPayeeValid(*block.vtx[0], pindex->nHeight, blockSubsidy)) {
+    if (!IsBlockPayeeValid(*block.vtx[0], pindex->nHeight, pindex->nTime, blockSubsidy)) {
         mapRejectedBlocks.insert(std::make_pair(block.GetHash(), GetTime()));
         return state.DoS(0, error("ConnectBlock(EVPZNODES): couldn't find evo znode payments"),
                                 REJECT_INVALID, "bad-cb-payee");
@@ -3277,6 +3301,7 @@ bool static DisconnectTip(CValidationState& state, const CChainParams& chainpara
     block.lelantusTxInfo = std::make_shared<lelantus::CLelantusTxInfo>();
 
     std::unordered_map<Scalar, int> lelantusSerialsToRemove;
+    std::vector<lelantus::RangeProof> rangeProofsToRemove;
     sigma::spend_info_container sigmaSerialsToRemove;
 
     for (CTransactionRef tx : block.vtx) {
@@ -3289,7 +3314,7 @@ bool static DisconnectTip(CValidationState& state, const CChainParams& chainpara
                 try {
                     joinsplit = lelantus::ParseLelantusJoinSplit(*tx);
                 }
-                catch (CBadTxIn &) {
+                catch (...) {
                     continue;
                 }
 
@@ -3303,6 +3328,8 @@ bool static DisconnectTip(CValidationState& state, const CChainParams& chainpara
                 for (size_t i = 0; i < serials.size(); i++) {
                     lelantusSerialsToRemove.insert(std::make_pair(serials[i], ids[i]));
                 }
+
+                rangeProofsToRemove.push_back(joinsplit->getLelantusProof().bulletproofs);
             } else if (tx->IsSigmaSpend()) {
                 for (const CTxIn &txin : tx->vin) {
                     std::unique_ptr<sigma::CoinSpend> spend;
@@ -3348,6 +3375,11 @@ bool static DisconnectTip(CValidationState& state, const CChainParams& chainpara
     if (lelantusSerialsToRemove.size() > 0) {
         batchProofContainer->removeLelantus(lelantusSerialsToRemove);
     }
+
+    if (rangeProofsToRemove.size() > 0) {
+        batchProofContainer->remove(rangeProofsToRemove);
+    }
+
 
     // Roll back MTP state
     MTPState::GetMTPState()->SetLastBlock(pindexDelete->pprev, chainparams.GetConsensus());
@@ -4514,6 +4546,9 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, const Co
     if (pindexPrev && pindexPrev->nTime >= consensusParams.nPPSwitchTime && block.nTime < consensusParams.nPPSwitchTime)
         return state.Invalid(false, REJECT_INVALID, "bad-blk-progpow-state", "Cannot go back from ProgPOW");
 
+    if (pindexPrev && pindexPrev->nTime >= consensusParams.stage3StartTime && block.nTime < consensusParams.stage3StartTime)
+        return state.Invalid(false, REJECT_INVALID, "bad-blk-stage3-state", "Cannot go back to 5 minutes between blocks");
+
     if (block.IsProgPow() && block.nHeight != nHeight)
         return state.DoS(100, false, REJECT_INVALID, "bad-blk-progpow", "ProgPOW height doesn't match chain height");
 
@@ -4542,16 +4577,34 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, const Co
 
     if (nHeight >= consensusParams.nSubsidyHalvingFirst) {
         if (nHeight < consensusParams.nSubsidyHalvingFirst + consensusParams.nSubsidyHalvingInterval) {
-            // "stage 2" interval between first and second halvings
-            CScript devPayoutScript = GetScriptForDestination(CBitcoinAddress(consensusParams.stage2DevelopmentFundAddress).Get());
-            CAmount devPayoutValue = (GetBlockSubsidy(nHeight, consensusParams, block.nTime) * consensusParams.stage2DevelopmentFundShare) / 100;
-            bool found = false;
-            for (const CTxOut &txout: block.vtx[0]->vout) {
-                if ((found = txout.scriptPubKey == devPayoutScript && txout.nValue == devPayoutValue) == true)
-                    break;
+            if (block.nTime >= consensusParams.stage3StartTime) {
+                CScript devPayoutScript = GetScriptForDestination(CBitcoinAddress(consensusParams.stage3DevelopmentFundAddress).Get());
+                CAmount devPayoutValue = (GetBlockSubsidy(nHeight, consensusParams, block.nTime) * consensusParams.stage3DevelopmentFundShare) / 100;
+                CScript communityPayoutScript = GetScriptForDestination(CBitcoinAddress(consensusParams.stage3CommunityFundAddress).Get());
+                CAmount communityPayoutValue = (GetBlockSubsidy(nHeight, consensusParams, block.nTime) * consensusParams.stage3CommunityFundShare) / 100;
+
+                bool devFound = false, communityFound = false;
+                for (const CTxOut &txout: block.vtx[0]->vout) {
+                    if (txout.scriptPubKey == devPayoutScript && txout.nValue == devPayoutValue)
+                        devFound = true;
+                    else if (txout.scriptPubKey == communityPayoutScript && txout.nValue == communityPayoutValue)
+                        communityFound = true;
+                }
+                if (!devFound || !communityFound)
+                    return state.Invalid(false, state.GetRejectCode(), state.GetRejectReason(), "Stage 3 developer/community reward check failed");
             }
-            if (!found)
-                return state.Invalid(false, state.GetRejectCode(), state.GetRejectReason(), "Stage 2 developer reward check failed");
+            else {
+                // "stage 2" interval between first and second halvings
+                CScript devPayoutScript = GetScriptForDestination(CBitcoinAddress(consensusParams.stage2DevelopmentFundAddress).Get());
+                CAmount devPayoutValue = (GetBlockSubsidy(nHeight, consensusParams, block.nTime) * consensusParams.stage2DevelopmentFundShare) / 100;
+                bool found = false;
+                for (const CTxOut &txout: block.vtx[0]->vout) {
+                    if ((found = txout.scriptPubKey == devPayoutScript && txout.nValue == devPayoutValue) == true)
+                        break;
+                }
+                if (!found)
+                    return state.Invalid(false, state.GetRejectCode(), state.GetRejectReason(), "Stage 2 developer reward check failed");
+            }
         }
     }
     else if (!CheckZerocoinFoundersInputs(*block.vtx[0], state, consensusParams, nHeight, block.IsMTP())) {
